@@ -1,16 +1,35 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { groupItems } from "../lib/events";
 import { fmtDate, tierName } from "../lib/format";
 import { type FilterState, filterItems, initialFilter, sourceOptions } from "../lib/select";
-import type { Item, Stats, ViewMode } from "../lib/types";
+import type {
+  DailyPayload,
+  HealthSummary,
+  Item,
+  PoolPayload,
+  PoolView,
+  Stats,
+  ViewMode,
+} from "../lib/types";
+import { onlyQueryChanged, readUrlState, type UrlState, writeUrlState } from "../lib/url";
+import { useDebouncedValue } from "../lib/useDebounced";
 import BriefView from "./BriefView";
+import DailyView from "./DailyView";
+import EventList from "./EventList";
+import HealthPanel from "./HealthPanel";
 import ItemList from "./ItemList";
+import Pagination from "./Pagination";
 import StatsStrip from "./StatsStrip";
 import Toolbar from "./Toolbar";
 import TopBar from "./TopBar";
 
 // 勾选以条目的稳定 id 为键。
 const SEL_KEY = "ainformer.selection.v1";
+// 「这不是同一件事」的反馈，按 event_id 记，只在前端本地生效。
+const SPLIT_KEY = "ainformer.split.v1";
 const DATA_URL = "/data/items.json";
+const DAILY_URL = "/data/daily.json";
+const PAGE_SIZE = 50;
 
 interface Props {
   stats: Stats;
@@ -26,39 +45,102 @@ function loadSelection(): Set<string> {
   }
 }
 
+function loadSplit(): Set<string> {
+  try {
+    return new Set(JSON.parse(localStorage.getItem(SPLIT_KEY) || "[]") as string[]);
+  } catch {
+    return new Set();
+  }
+}
+
 export default function PoolApp({ stats, windowDays, initialItems }: Props) {
   const [items, setItems] = useState<Item[]>(initialItems);
   const [loaded, setLoaded] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [filter, setFilter] = useState<FilterState>(initialFilter);
+  // 输入框立即回显；过滤等 200ms 再用新值，避免每次按键全量重算。
+  const [query, setQuery] = useState(filter.q);
   const [mode, setMode] = useState<ViewMode>("pool");
+  const [view, setView] = useState<PoolView>("events");
+  const [daily, setDaily] = useState<DailyPayload | null>(null);
+  const [dailyError, setDailyError] = useState<string | null>(null);
+  const [page, setPage] = useState(1);
   const [cur, setCur] = useState(0);
   // 服务端渲染时读不到 localStorage，首屏必须是空集合，否则客户端首次渲染
   // 与 SSR 输出不一致，React 会判定 hydration mismatch 并整树重渲染。
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
+  const [split, setSplit] = useState<Set<string>>(() => new Set());
   const [restored, setRestored] = useState(false);
+  const [health, setHealth] = useState<HealthSummary | null>(null);
 
   useEffect(() => {
     setSelected(loadSelection());
+    setSplit(loadSplit());
     setRestored(true);
   }, []);
 
+  const ctrlRef = useRef<AbortController | null>(null);
+
   // 构建期只内联首屏可见的前若干条，完整列表由浏览器单独请求，可独立缓存。
-  useEffect(() => {
-    let cancelled = false;
-    fetch(DATA_URL)
+  const loadData = useCallback(() => {
+    ctrlRef.current?.abort();
+    const ctrl = new AbortController();
+    ctrlRef.current = ctrl;
+    const timer = setTimeout(() => ctrl.abort(), 15000);
+    setLoadError(null);
+    fetch(DATA_URL, { signal: ctrl.signal })
       .then((res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        return res.json() as Promise<{ items: Item[] }>;
+        return res.json() as Promise<PoolPayload>;
       })
       .then((payload) => {
-        if (cancelled) return;
+        if (ctrl.signal.aborted) return;
         setItems(payload.items);
+        setHealth(payload.health);
         setLoaded(true);
+        // 旧数据里勾选过、新数据里已不存在的 id 清掉，避免存储无限增长。
+        const ids = new Set(payload.items.map((it) => it.id));
+        setSelected((prev) => {
+          const next = new Set([...prev].filter((id) => ids.has(id)));
+          return next.size === prev.size ? prev : next;
+        });
       })
       .catch((err: unknown) => {
+        // 卸载时 cleanup 会 abort，此时 ctrlRef 已置空，不该再报错。
+        if (ctrlRef.current !== ctrl) return;
         // 不静默降级：失败要说出来，否则用户会以为只有前几十条
-        if (!cancelled) setLoadError(err instanceof Error ? err.message : String(err));
+        setLoadError(
+          err instanceof DOMException && err.name === "AbortError"
+            ? "请求超时"
+            : err instanceof Error
+              ? err.message
+              : String(err),
+        );
+      })
+      .finally(() => clearTimeout(timer));
+  }, []);
+
+  useEffect(() => {
+    loadData();
+    return () => {
+      ctrlRef.current?.abort();
+      ctrlRef.current = null;
+    };
+  }, [loadData]);
+
+  // 日报单独请求，加载失败时「今日」视图给出明确提示而不是空白。
+  useEffect(() => {
+    let cancelled = false;
+    fetch(DAILY_URL)
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json() as Promise<DailyPayload>;
+      })
+      .then((payload) => {
+        if (!cancelled) setDaily(payload);
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) setDailyError(err instanceof Error ? err.message : String(err));
       });
     return () => {
       cancelled = true;
@@ -70,14 +152,81 @@ export default function PoolApp({ stats, windowDays, initialItems }: Props) {
     if (!restored) return;
     try {
       localStorage.setItem(SEL_KEY, JSON.stringify([...selected]));
+      localStorage.setItem(SPLIT_KEY, JSON.stringify([...split]));
     } catch {
       // 存储不可用时静默降级为仅本次会话有效
     }
-  }, [selected, restored]);
+  }, [selected, split, restored]);
+
+  // URL 承载筛选/视图/页码：进页面读一次，之后变更写回，支持分享与刷新保留。
+  const [hydrated, setHydrated] = useState(false);
+  const prevUrlRef = useRef<UrlState | null>(null);
+
+  useEffect(() => {
+    const s = readUrlState(location.search);
+    setFilter(s.filter);
+    setQuery(s.filter.q);
+    setMode(s.mode);
+    setPage(s.page);
+    prevUrlRef.current = s;
+    setHydrated(true);
+  }, []);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    const next: UrlState = { filter, mode, page };
+    const prev = prevUrlRef.current;
+    // 打字只 replace（不刷历史），其余操作 push（后退键可回退）。
+    const timer = setTimeout(() => {
+      writeUrlState(next, prev && onlyQueryChanged(prev, next) ? "replace" : "push");
+      prevUrlRef.current = next;
+    }, 200);
+    return () => clearTimeout(timer);
+  }, [hydrated, filter, mode, page]);
+
+  useEffect(() => {
+    function onPop() {
+      const s = readUrlState(location.search);
+      setFilter(s.filter);
+      setQuery(s.filter.q);
+      setMode(s.mode);
+      setPage(s.page);
+      prevUrlRef.current = s;
+    }
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
+
+  // 输入防抖：只有防抖值追上当前输入、且与已生效的筛选词不同时才更新。
+  const debouncedQuery = useDebouncedValue(query, 200);
+  useEffect(() => {
+    if (!hydrated) return;
+    if (query !== debouncedQuery) return;
+    if (filter.q === debouncedQuery) return;
+    setFilter((prev) => ({ ...prev, q: debouncedQuery }));
+    setPage(1);
+  }, [hydrated, query, debouncedQuery, filter.q]);
 
   const visible = useMemo(() => filterItems(items, filter), [items, filter]);
   const selectedItems = useMemo(() => items.filter((it) => selected.has(it.id)), [items, selected]);
   const sources = useMemo(() => sourceOptions(items), [items]);
+  const groups = useMemo(() => groupItems(visible, split), [visible, split]);
+
+  const pageCount = Math.max(1, Math.ceil(visible.length / PAGE_SIZE));
+  const paged = useMemo(
+    () => visible.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE),
+    [visible, page],
+  );
+
+  // 筛选条件变化后回到第一页；页码越界时夹回最后一页。
+  const changeFilter = useCallback((next: FilterState) => {
+    setFilter(next);
+    setPage(1);
+  }, []);
+
+  useEffect(() => {
+    if (page > pageCount) setPage(pageCount);
+  }, [page, pageCount]);
 
   // 移除条目后游标可能越界，回到第一条
   useEffect(() => {
@@ -91,6 +240,24 @@ export default function PoolApp({ stats, windowDays, initialItems }: Props) {
       else next.add(id);
       return next;
     });
+  }, []);
+
+  // 事件视图里勾选是整个事件（其全部成员）一起勾。
+  const toggleEvent = useCallback((ids: string[]) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      const allOn = ids.every((id) => next.has(id));
+      for (const id of ids) {
+        if (allOn) next.delete(id);
+        else next.add(id);
+      }
+      return next;
+    });
+  }, []);
+
+  // 用户判定「这不是同一件事」：把该事件拆成单条，只影响本地视图。
+  const feedback = useCallback((eventId: string) => {
+    setSplit((prev) => new Set(prev).add(eventId));
   }, []);
 
   const selectAt = useCallback(
@@ -144,12 +311,15 @@ export default function PoolApp({ stats, windowDays, initialItems }: Props) {
     URL.revokeObjectURL(a.href);
   }
 
-  // 总数在构建期已知，不随加载状态跳变；"当前显示"在完整数据到达后才改为筛选结果
+  // 总数在构建期已知，不随加载状态跳变；加载完成前"当前显示"只算真正渲染出来的条数。
   const total = stats.after_dedup;
-  const shown = loaded ? visible.length : stats.after_dedup;
+  const shown = loaded ? visible.length : initialItems.length;
 
   return (
     <>
+      <a className="skip" href="#main">
+        跳到主内容
+      </a>
       <TopBar mode={mode} total={total} selectedCount={selected.size} onModeChange={setMode} />
       <StatsStrip
         sourcesOk={stats.sources_ok}
@@ -160,38 +330,107 @@ export default function PoolApp({ stats, windowDays, initialItems }: Props) {
         windowDays={windowDays}
       />
 
-      <div className="wrap main">
-        {mode === "pool" ? (
+      <main className="wrap main" id="main">
+        <HealthPanel health={health} />
+        {mode === "daily" ? (
+          daily ? (
+            <DailyView daily={daily} />
+          ) : dailyError ? (
+            <div className="empty">
+              日报暂不可用（{dailyError}）。配置 LLM_API_KEY 后运行一次 bin/daily.py 再刷新。
+            </div>
+          ) : (
+            <div className="hint" role="status">
+              正在加载日报…
+            </div>
+          )
+        ) : mode === "pool" ? (
           <>
+            <div className="sr-only" aria-live="polite">
+              {view === "events"
+                ? `共 ${groups.length} 个事件`
+                : `共 ${visible.length} 条，第 ${page} / ${pageCount} 页`}
+            </div>
+            <div className="seg view-toggle">
+              <button
+                type="button"
+                aria-pressed={view === "events"}
+                className={view === "events" ? "on" : undefined}
+                onClick={() => setView("events")}
+              >
+                按事件 <span className="cnt">{groups.length}</span>
+              </button>
+              <button
+                type="button"
+                aria-pressed={view === "items"}
+                className={view === "items" ? "on" : undefined}
+                onClick={() => setView("items")}
+              >
+                按条 <span className="cnt">{visible.length}</span>
+              </button>
+            </div>
             <Toolbar
               filter={filter}
+              query={query}
               sources={sources}
               selectedCount={selected.size}
-              onChange={setFilter}
-              onSelectVisible={() =>
+              onChange={changeFilter}
+              onQueryChange={setQuery}
+              onSelectVisible={() => {
+                const target = view === "events" ? visible : paged;
                 setSelected((prev) => {
                   const next = new Set(prev);
-                  visible.forEach((it) => {
+                  target.forEach((it) => {
                     next.add(it.id);
                   });
                   return next;
-                })
-              }
+                });
+              }}
               onClear={() => setSelected(new Set())}
               onExport={exportMarkdown}
             />
-            <ItemList items={visible} selected={selected} onToggle={toggle} />
+            {!loaded && !loadError ? (
+              <div className="hint" role="status">
+                正在加载完整列表…
+              </div>
+            ) : null}
+            {view === "events" ? (
+              <EventList
+                groups={groups}
+                selected={selected}
+                onToggle={toggleEvent}
+                onFeedback={feedback}
+              />
+            ) : (
+              <ItemList
+                items={paged}
+                selected={selected}
+                onToggle={toggle}
+                footer={
+                  <Pagination
+                    page={page}
+                    pageCount={pageCount}
+                    total={visible.length}
+                    onChange={setPage}
+                  />
+                }
+              />
+            )}
             {loadError ? (
               <div className="empty">
-                完整列表加载失败（{loadError}），当前仅显示构建期保留的 {initialItems.length}{" "}
-                条。刷新重试。
+                完整列表加载失败（{loadError}），当前仅显示构建期保留的 {initialItems.length} 条。
+                <br />
+                <br />
+                <button className="btn" type="button" onClick={loadData}>
+                  重试
+                </button>
               </div>
             ) : null}
           </>
         ) : (
           <BriefView items={selectedItems} cur={cur} onSelect={selectAt} onRemove={toggle} />
         )}
-      </div>
+      </main>
     </>
   );
 }
